@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @dataclass
@@ -16,8 +17,6 @@ class ModelConfig:
 
 
 class VisionToTextAdapter(nn.Module):
-    """Maps vision encoder hidden states to LLM embedding space."""
-
     def __init__(
         self,
         vision_hidden_size: int,
@@ -29,13 +28,19 @@ class VisionToTextAdapter(nn.Module):
         self.text_hidden_size = text_hidden_size
         self.num_image_tokens = num_image_tokens
 
-        # TODO: replace with a small projection network.
-        # Recommended: LayerNorm -> Linear -> GELU -> Linear.
-        raise NotImplementedError("Implement VisionToTextAdapter.__init__")
+        self.norm = nn.LayerNorm(vision_hidden_size)
+        self.proj = nn.Sequential(
+            nn.Linear(vision_hidden_size, text_hidden_size),
+            nn.GELU(),
+            nn.Linear(text_hidden_size, text_hidden_size),
+        )
 
     def forward(self, vision_hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return visual embeddings [B, num_image_tokens, text_hidden_size]."""
-        raise NotImplementedError("Implement VisionToTextAdapter.forward")
+        x = self.norm(vision_hidden_states)
+        x = x.transpose(1, 2)
+        x = F.adaptive_avg_pool1d(x, self.num_image_tokens)
+        x = x.transpose(1, 2)
+        return self.proj(x)
 
 
 def merge_visual_embeddings(
@@ -44,29 +49,13 @@ def merge_visual_embeddings(
     visual_embeds: torch.Tensor,
     image_token_id: int,
 ) -> torch.Tensor:
-    """Replace embeddings at <image> token positions with visual embeddings.
-
-    Args:
-        input_embeds: [B, L, D] text embeddings.
-        input_ids: [B, L] token ids.
-        visual_embeds: [B, K, D] visual embeddings.
-        image_token_id: token id used as visual placeholder.
-
-    Returns:
-        Tensor [B, L, D] with visual embeddings inserted.
-
-    Assumption for public tests:
-        each row has exactly K positions where input_ids == image_token_id.
-    """
-    raise NotImplementedError("Implement visual/text embedding merge")
+    merged = input_embeds.clone()
+    mask = input_ids == image_token_id
+    merged[mask] = visual_embeds.reshape(-1, visual_embeds.shape[-1]).to(merged.dtype)
+    return merged
 
 
 class MathVLM(nn.Module):
-    """Thin wrapper around vision encoder, adapter and language model.
-
-    In Track A/B, vision encoder and LLM should be frozen; adapter trainable.
-    """
-
     def __init__(self, vision_encoder: nn.Module, language_model: nn.Module, config: ModelConfig) -> None:
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -79,25 +68,39 @@ class MathVLM(nn.Module):
         )
 
     def freeze_backbones(self) -> None:
-        """Freeze vision encoder and language model parameters."""
         for p in self.vision_encoder.parameters():
             p.requires_grad = False
         for p in self.language_model.parameters():
             p.requires_grad = False
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> Any:
-        """Forward pass with loss.
+    def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        b, t = pixel_values.shape[0], pixel_values.shape[1]
+        flat = pixel_values.flatten(0, 1)
+        out = self.vision_encoder(flat)
+        hidden = getattr(out, "last_hidden_state", out)
+        return hidden.reshape(b, t * hidden.shape[1], hidden.shape[2])
 
-        TODO:
-            - encode images;
-            - map to visual embeddings;
-            - get text input embeddings;
-            - merge visual/text embeddings;
-            - call language_model with inputs_embeds, attention_mask, labels.
-        """
-        raise NotImplementedError("Implement MathVLM.forward")
+    def _visual_embeds(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.adapter(self.encode_images(pixel_values))
+
+    def _merged_embeds(self, input_ids: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:
+        text_embeds = self.language_model.get_input_embeddings()(input_ids)
+        visual_embeds = self._visual_embeds(pixel_values).to(text_embeds.dtype)
+        return merge_visual_embeddings(text_embeds, input_ids, visual_embeds, self.config.image_token_id)
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> Any:
+        inputs_embeds = self._merged_embeds(batch["input_ids"], batch["pixel_values"])
+        return self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch.get("attention_mask"),
+            labels=batch.get("labels"),
+        )
 
     @torch.no_grad()
     def generate(self, batch: dict[str, torch.Tensor], **generation_kwargs: Any) -> torch.Tensor:
-        """Generate answer token ids."""
-        raise NotImplementedError("Implement MathVLM.generate")
+        inputs_embeds = self._merged_embeds(batch["input_ids"], batch["pixel_values"])
+        return self.language_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch.get("attention_mask"),
+            **generation_kwargs,
+        )
