@@ -127,7 +127,7 @@ class MockLanguageModel(nn.Module):
         return self.embed
 
     def _backbone(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
-        b, length, _ = inputs_embeds.shape
+        _, length, _ = inputs_embeds.shape
         pos_ids = torch.arange(length, device=inputs_embeds.device)
         x = inputs_embeds + self.pos(pos_ids).unsqueeze(0)
 
